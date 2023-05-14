@@ -120,8 +120,6 @@ def train(description, workspace,
     vae.requires_grad_(False)
 
     model.unet.enable_xformers_memory_efficient_attention()
-    model.unet.enable_gradient_checkpointing()
-    model.text_encoder.gradient_checkpointing_enable()
 
     model.to(device, dtype=torch_dtype)
     optimizer = optimizer_class(model.parameters(), lr=learning_rate)
