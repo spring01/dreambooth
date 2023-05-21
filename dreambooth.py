@@ -472,6 +472,166 @@ def sgd(params: List[Tensor],
         param.add_(d_p, alpha=-lr)
 
 
+class CPUAdamW(torch.optim.AdamW):
+    """
+    AdamW with states (exp_avg, exp_avg_sq, etc.) offloaded to CPU as float32.
+    """
+
+    def _init_group(
+        self,
+        group,
+        params_with_grad,
+        grads,
+        amsgrad,
+        exp_avgs,
+        exp_avg_sqs,
+        max_exp_avg_sqs,
+        state_steps,
+    ):
+        for p in group['params']:
+            if p.grad is None:
+                continue
+            params_with_grad.append(p)
+            if p.grad.is_sparse:
+                raise RuntimeError('AdamW does not support sparse gradients')
+            grads.append(p.grad)
+
+            state = self.state[p]
+
+            # State initialization
+            if len(state) == 0:
+                state['step'] = (
+                    torch.zeros((1,), dtype=torch.float, device=p.device)
+                    if group['capturable'] or group['fused']
+                    else torch.tensor(0.0)
+                )
+                # Exponential moving average of gradient values
+                state['exp_avg'] = torch.zeros_like(
+                    p, memory_format=torch.preserve_format, dtype=torch.float32, device='cpu'
+                )
+                # Exponential moving average of squared gradient values
+                state['exp_avg_sq'] = torch.zeros_like(
+                    p, memory_format=torch.preserve_format, dtype=torch.float32, device='cpu'
+                )
+                if amsgrad:
+                    # Maintains max of all exp. moving avg. of sq. grad. values
+                    state['max_exp_avg_sq'] = torch.zeros_like(
+                        p, memory_format=torch.preserve_format, dtype=torch.float32, device='cpu'
+                    )
+
+            exp_avgs.append(state['exp_avg'])
+            exp_avg_sqs.append(state['exp_avg_sq'])
+
+            if amsgrad:
+                max_exp_avg_sqs.append(state['max_exp_avg_sq'])
+
+            state_steps.append(state['step'])
+
+    @torch.no_grad()
+    def step(self):
+        for group in self.param_groups:
+            params_with_grad = []
+            grads = []
+            exp_avgs = []
+            exp_avg_sqs = []
+            max_exp_avg_sqs = []
+            state_steps = []
+            amsgrad = group['amsgrad']
+            beta1, beta2 = group['betas']
+
+            self._init_group(
+                group,
+                params_with_grad,
+                grads,
+                amsgrad,
+                exp_avgs,
+                exp_avg_sqs,
+                max_exp_avg_sqs,
+                state_steps,
+            )
+
+            adamw(
+                params_with_grad,
+                grads,
+                exp_avgs,
+                exp_avg_sqs,
+                max_exp_avg_sqs,
+                state_steps,
+                amsgrad=amsgrad,
+                beta1=beta1,
+                beta2=beta2,
+                lr=group['lr'],
+                weight_decay=group['weight_decay'],
+                eps=group['eps'],
+                maximize=group['maximize'],
+                grad_scale=getattr(self, 'grad_scale', None),
+                found_inf=getattr(self, 'found_inf', None),
+            )
+
+
+def adamw(
+    params: List[Tensor],
+    grads: List[Tensor],
+    exp_avgs: List[Tensor],
+    exp_avg_sqs: List[Tensor],
+    max_exp_avg_sqs: List[Tensor],
+    state_steps: List[Tensor],
+    grad_scale: Optional[Tensor] = None,
+    found_inf: Optional[Tensor] = None,
+    *,
+    amsgrad: bool,
+    beta1: float,
+    beta2: float,
+    lr: float,
+    weight_decay: float,
+    eps: float,
+    maximize: bool,
+):
+    assert grad_scale is None and found_inf is None
+
+    for i, param in enumerate(params):
+        grad = grads[i] if not maximize else -grads[i]
+        exp_avg = exp_avgs[i].to(grad.device, non_blocking=True)
+        exp_avg_sq = exp_avg_sqs[i].to(grad.device, non_blocking=True)
+        step_t = state_steps[i].to(grad.device, non_blocking=True)
+
+        # update step
+        step_t += 1
+
+        # Perform stepweight decay
+        param_f32 = param.to(torch.float32, non_blocking=True)
+        param_f32.mul_(1 - lr * weight_decay)
+
+        # Decay the first and second moment running average coefficient
+        grad_f32 = grad.to(torch.float32, non_blocking=True)
+        exp_avg.mul_(beta1).add_(grad_f32, alpha=1 - beta1)
+        exp_avgs[i] = exp_avg.to('cpu', non_blocking=True)
+        exp_avg_sq.mul_(beta2).addcmul_(grad_f32, grad_f32, value=1 - beta2)
+        exp_avg_sqs[i] = exp_avg_sq.to('cpu', non_blocking=True)
+
+        step = step_t.item()
+
+        bias_correction1 = 1 - beta1 ** step
+        bias_correction2 = 1 - beta2 ** step
+
+        step_size = lr / bias_correction1
+
+        bias_correction2_sqrt = math.sqrt(bias_correction2)
+
+        if amsgrad:
+            # Maintains the maximum of all 2nd moment running avg. till now
+            max_exp_avg_sqs = max_exp_avg_sqs[i].to(grad.device, non_blocking=True)
+            torch.maximum(max_exp_avg_sqs, exp_avg_sq, out=max_exp_avg_sqs)
+            max_exp_avg_sqs[i] = max_exp_avg_sqs.to('cpu', non_blocking=True)
+            # Use the max. for normalizing running avg. of gradient
+            denom = (max_exp_avg_sqs.sqrt() / bias_correction2_sqrt).add_(eps)
+        else:
+            denom = (exp_avg_sq.sqrt() / bias_correction2_sqrt).add_(eps)
+
+        param_f32.addcdiv_(exp_avg, denom, value=-step_size)
+        param.copy_(param_f32.to(param.dtype, non_blocking=True))
+
+
 def main_sample():
     parser = argparse.ArgumentParser()
     parser.add_argument('prompt', help='Text prompt for sampling image.')
