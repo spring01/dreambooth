@@ -19,9 +19,11 @@ import logging
 import math
 import os
 from pathlib import Path
+from typing import List, Optional
 
 from PIL import Image
 import torch
+from torch import Tensor
 from torch.nn import functional as F
 from torch.utils.data import Dataset
 from torchvision import transforms
@@ -56,6 +58,10 @@ def main():
     train(args.description, args.workspace, args.instance_data, args.class_data, args.model_dir)
 
 
+def default_optimizer(parameters, lr):
+    return CPUSGD(parameters, lr=lr, momentum=0.9)
+
+
 def train(description, workspace,
           instance_data='instance_data',
           class_data='class_data',
@@ -63,13 +69,13 @@ def train(description, workspace,
           pretrained='stabilityai/stable-diffusion-2-base',
           num_class_images=200,
           sample_batch_size=1,
-          train_batch_size=1,
-          num_train_epochs=10,
+          train_batch_size=2,
+          num_train_epochs=4,
           gradient_accumulation_steps=1,
           device='cuda',
           torch_dtype=torch.float16,
-          optimizer_class=torch.optim.SGD,
-          learning_rate=1e-1):
+          optimizer_class=default_optimizer,
+          learning_rate=5e-2):
     logger = logging.getLogger(__name__)
     instance_prompt = f'a photo of sks {description}'
     class_prompt = f'a photo of {description}'
@@ -133,7 +139,6 @@ def train(description, workspace,
         class_prompt=class_prompt,
         tokenizer=tokenizer,
         size=512,
-        center_crop=False,
     )
 
     train_dataloader = torch.utils.data.DataLoader(
@@ -212,9 +217,9 @@ def train(description, workspace,
                 prior_loss = F.mse_loss(model_pred_prior.float(), target_prior.float(), reduction='mean')
 
                 # Add the prior loss to the instance loss.
-                loss = loss + prior_loss
+                total_loss = loss + prior_loss
 
-                scaled_loss = loss.float() * cur_scale
+                scaled_loss = total_loss.float() * cur_scale
                 scaled_loss.backward()
 
             if any(has_inf_or_nan(param.grad.data) for param in model.parameters()):
@@ -260,10 +265,8 @@ class DreamBoothDataset(Dataset):
         class_data_root=None,
         class_prompt=None,
         size=512,
-        center_crop=False,
     ):
         self.size = size
-        self.center_crop = center_crop
         self.tokenizer = tokenizer
 
         self.instance_data_root = Path(instance_data_root)
@@ -288,7 +291,6 @@ class DreamBoothDataset(Dataset):
         self.image_transforms = transforms.Compose(
             [
                 transforms.Resize(size, interpolation=transforms.InterpolationMode.BILINEAR),
-                transforms.CenterCrop(size) if center_crop else transforms.RandomCrop(size),
                 transforms.ToTensor(),
                 transforms.Normalize([0.5], [0.5]),
             ]
@@ -392,6 +394,82 @@ def has_inf_or_nan(x):
         if cpu_sum == float('inf') or cpu_sum == -float('inf') or cpu_sum != cpu_sum:
             return True
         return False
+
+
+class CPUSGD(torch.optim.SGD):
+    """
+    SGD with states (momentum buffers) offloaded to CPU.
+    """
+
+    def _init_group(self, group, params_with_grad, d_p_list, momentum_buffer_list):
+        for p in group['params']:
+            if p.grad is not None:
+                params_with_grad.append(p)
+                d_p_list.append(p.grad)
+
+                state = self.state[p]
+                if 'momentum_buffer' not in state:
+                    momentum_buffer_list.append(None)
+                else:
+                    momentum_buffer_list.append(state['momentum_buffer'])
+
+    @torch.no_grad()
+    def step(self):
+        for group in self.param_groups:
+            params_with_grad = []
+            d_p_list = []
+            momentum_buffer_list = []
+
+            self._init_group(group, params_with_grad, d_p_list, momentum_buffer_list)
+
+            sgd(params_with_grad,
+                d_p_list,
+                momentum_buffer_list,
+                weight_decay=group['weight_decay'],
+                momentum=group['momentum'],
+                lr=group['lr'],
+                dampening=group['dampening'],
+                nesterov=group['nesterov'],
+                maximize=group['maximize'])
+
+            # update momentum_buffers in state
+            for p, momentum_buffer in zip(params_with_grad, momentum_buffer_list):
+                state = self.state[p]
+                state['momentum_buffer'] = momentum_buffer
+
+
+def sgd(params: List[Tensor],
+        d_p_list: List[Tensor],
+        momentum_buffer_list: List[Optional[Tensor]],
+        *,
+        weight_decay: float,
+        momentum: float,
+        lr: float,
+        dampening: float,
+        nesterov: bool,
+        maximize: bool):
+    for i, param in enumerate(params):
+        d_p = d_p_list[i] if not maximize else -d_p_list[i]
+
+        if weight_decay != 0:
+            d_p = d_p.add(param, alpha=weight_decay)
+
+        if momentum != 0:
+            buf = momentum_buffer_list[i]
+
+            if buf is None:
+                buf = torch.clone(d_p).detach()
+            else:
+                buf = buf.to(param.device, non_blocking=True)
+                buf.mul_(momentum).add_(d_p, alpha=1 - dampening)
+            momentum_buffer_list[i] = buf.to('cpu', non_blocking=True)
+
+            if nesterov:
+                d_p = d_p.add(buf, alpha=momentum)
+            else:
+                d_p = buf
+
+        param.add_(d_p, alpha=-lr)
 
 
 def main_sample():
